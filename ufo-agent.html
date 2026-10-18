@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UFO-agent</title>
+<style>
+:root{--bg:#10141c;--panel:#182030;--line:#2a3650;--text:#e6ebf5;--mute:#8d9ab5;--acc:#6fe3c1;--warn:#f0b35a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 Georgia,"Times New Roman",serif}
+header{padding:40px 20px 24px;max-width:960px;margin:auto}
+h1{font-size:clamp(2rem,6vw,3.4rem);margin:0 0 6px;letter-spacing:-.02em}
+.sub{color:var(--mute);margin:0 0 20px}
+main{max-width:960px;margin:auto;padding:0 20px 60px}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:20px}
+input,select,button,textarea{font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px 12px}
+input{flex:1;min-width:220px}
+button{cursor:pointer;background:var(--acc);color:#0a1a14;border:0;font-weight:bold}
+button:disabled{opacity:.5;cursor:wait}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--warn);outline-offset:2px}
+#status{color:var(--mute);margin:8px 0 18px;min-height:1.5em}
+#status.err{color:var(--warn)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:4px;padding:14px 16px}
+.card h3{margin:0 0 4px;font-size:1.05rem}
+.meta{color:var(--mute);font-size:.85rem;margin-bottom:8px}
+.card p{margin:0 0 8px;font-size:.95rem}
+.cred{color:var(--warn);letter-spacing:2px}
+a{color:var(--acc)}
+h2{margin:36px 0 10px;font-size:1.3rem}
+#log{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;min-height:80px;max-height:340px;overflow:auto;white-space:pre-wrap}
+.note{color:var(--mute);font-size:.85rem;margin-top:30px}
+code{background:var(--panel);padding:1px 5px;border-radius:3px}
+</style>
+</head>
+<body>
+<header>
+  <h1>UFO-agent</h1>
+  <p class="sub">Henter siste observasjoner fra nyhetskilder og lar din egen Ollama-modell sortere og vurdere dem.</p>
+</header>
+<main>
+  <div class="bar">
+    <input id="server" value="https://chat01.evrylab.com:8080" aria-label="Ollama-server">
+    <select id="model" aria-label="Modell"><option>Laster modeller…</option></select>
+    <button id="go">Hent siste observasjoner</button>
+  </div>
+  <div id="status"></div>
+  <div class="grid" id="cards"></div>
+
+  <h2>Spør agenten</h2>
+  <div id="log">Still et spørsmål om observasjonene over, for eksempel «Hvilke er mest troverdige?»</div>
+  <div class="bar" style="margin-top:10px">
+    <input id="q" placeholder="Skriv spørsmålet ditt" aria-label="Spørsmål">
+    <button id="ask">Spør</button>
+  </div>
+
+  <p class="note">Modellen kjenner ikke til nye hendelser selv. Den får bare overskrifter fra nyhetssøk og oppsummerer dem, så vurderingene er skjønn og ikke fasit. Kilder er lenket på hvert kort.</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let news = [], sightings = [];
+
+const base = () => $("server").value.replace(/\/+$/, "");
+const setStatus = (t, err) => { $("status").textContent = t; $("status").className = err ? "err" : ""; };
+
+async function loadModels() {
+  try {
+    const r = await fetch(base() + "/api/tags");
+    const d = await r.json();
+    const names = (d.models || []).map(m => m.name);
+    $("model").innerHTML = names.map(n => `<option>${esc(n)}</option>`).join("") || "<option>Ingen modeller</option>";
+  } catch (e) {
+    $("model").innerHTML = "<option>Ingen kontakt</option>";
+    setStatus("Får ikke kontakt med Ollama. Sjekk at serveren kjører og at OLLAMA_ORIGINS tillater denne siden (se under).", true);
+  }
+}
+
+async function chat(messages, json) {
+  const r = await fetch(base() + "/api/chat", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({model: $("model").value, messages, stream: false, ...(json ? {format: "json"} : {})})
+  });
+  if (!r.ok) throw new Error("Ollama svarte " + r.status);
+  return (await r.json()).message.content;
+}
+
+async function fetchNews() {
+  const queries = ["UFO sighting", "UAP sighting"];
+  const all = [];
+  for (const q of queries) {
+    const feed = "https://news.google.com/rss/search?q=" + encodeURIComponent(q + " when:14d") + "&hl=en-US&gl=US&ceid=US:en";
+    const r = await fetch("https://api.rss2json.com/v1/api.json?rss_url=" + encodeURIComponent(feed));
+    const d = await r.json();
+    (d.items || []).forEach(i => all.push({title: i.title, link: i.link, date: i.pubDate}));
+  }
+  const seen = new Set();
+  return all.filter(i => !seen.has(i.title) && seen.add(i.title)).slice(0, 12);
+}
+
+$("go").onclick = async () => {
+  $("go").disabled = true; $("cards").innerHTML = "";
+  try {
+    setStatus("Henter nyheter om observasjoner…");
+    news = await fetchNews();
+    if (!news.length) { setStatus("Fant ingen nylige observasjoner.", true); return; }
+    setStatus("Modellen leser og sorterer " + news.length + " saker…");
+    const list = news.map((n, i) => `${i}: ${n.title} (${n.date})`).join("\n");
+    const prompt = `Her er overskrifter om UFO/UAP-observasjoner. For hver overskrift som handler om en konkret observasjon, trekk ut data. Svar KUN med JSON på formen {"items":[{"i":nummer,"sted":"by/land eller ukjent","type":"lys|objekt|formasjon|video|offisiell uttalelse|annet","sammendrag":"én setning på norsk","troverdighet":1-5}]}. Ikke finn på detaljer som ikke står i overskriften.\n\n${list}`;
+    let items = [];
+    try { items = JSON.parse(await chat([{role: "user", content: prompt}], true)).items || []; } catch (e) {}
+    sightings = items.filter(x => news[x.i]);
+    if (!sightings.length) sightings = news.map((n, i) => ({i, sted: "ukjent", type: "annet", sammendrag: n.title, troverdighet: 0}));
+    $("cards").innerHTML = sightings.map(s => {
+      const n = news[s.i], t = Math.max(0, Math.min(5, +s.troverdighet || 0));
+      return `<article class="card"><h3>${esc(s.sted)}</h3>
+        <div class="meta">${esc(s.type)} · ${esc(new Date(n.date.replace(" ", "T") + "Z").toLocaleDateString("no-NO") )}</div>
+        <p>${esc(s.sammendrag)}</p>
+        <div class="meta"><span class="cred" title="Troverdighet ${t} av 5">${"●".repeat(t)}${"○".repeat(5 - t)}</span> · <a href="${esc(n.link)}" target="_blank" rel="noopener">Kilde</a></div></article>`;
+    }).join("");
+    setStatus("Oppdatert " + new Date().toLocaleTimeString("no-NO") + ". " + sightings.length + " observasjoner.");
+  } catch (e) {
+    setStatus("Noe gikk galt: " + e.message, true);
+  } finally { $("go").disabled = false; }
+};
+
+$("ask").onclick = async () => {
+  const q = $("q").value.trim();
+  if (!q) return;
+  if (!news.length) { $("log").textContent = "Hent observasjoner først."; return; }
+  $("log").textContent = "Tenker…"; $("ask").disabled = true;
+  try {
+    const ctx = news.map(n => `- ${n.title} (${n.date})`).join("\n");
+    $("log").textContent = await chat([
+      {role: "system", content: "Du er en nøktern UFO-analytiker. Svar på norsk, kun basert på overskriftene du får. Si fra når noe ikke framgår."},
+      {role: "user", content: `Overskrifter:\n${ctx}\n\nSpørsmål: ${q}`}
+    ]);
+  } catch (e) { $("log").textContent = "Feil: " + e.message; }
+  $("ask").disabled = false;
+};
+$("q").addEventListener("keydown", e => e.key === "Enter" && $("ask").click());
+$("server").addEventListener("change", loadModels);
+loadModels();
+</script>
+</body>
+</html>
